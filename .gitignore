@@ -6,3 +6,15 @@ __pycache__/
 # OS generated files (Optional, but good practice)
 .DS_Store
 Thumbs.db
+
+# PyInstaller folders
+build/
+dist/
+
+# PyInstaller spec file
+*.spec
+app.spec
+
+# Python cache (if not already there)
+__pycache__/
+*.pyc

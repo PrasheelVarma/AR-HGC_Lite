@@ -1,5 +1,5 @@
 """
-app.py – Spatial Computing Dashboard  (CustomTkinter)
+app.py – Spatial Computing Dashboard (CustomTkinter)
 ======================================================
 """
 
@@ -9,12 +9,16 @@ import os
 import sys
 import time
 import math
+import threading
 from collections import deque
 
 import cv2
 import numpy as np
 import customtkinter as ctk
-from PIL import Image, ImageTk
+import pystray
+from pystray import MenuItem as item
+from PIL import Image, ImageDraw  # Fixed import for drawing the tray icon
+
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -24,7 +28,18 @@ from gestures import MouseController, GestureDetector
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+# --- PATH HANDLING FOR .EXE ---
+def resource_path(relative_path: str) -> str:
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(os.path.dirname(__file__))
+    return os.path.join(base_path, relative_path)
+
+MODEL_PATH = resource_path("hand_landmarker.task")
+
 CAM_W, CAM_H = 1280, 720
 DISPLAY_W, DISPLAY_H = 800, 450       
 
@@ -52,8 +67,14 @@ class HandControllerApp(ctk.CTk):
         self.title("HG Control — Lite Dashboard")
         self.geometry("1280x720")
         self.minsize(1100, 600)
+        
+        # Override the close button to minimize to tray
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.configure(fg_color="#0d0d12")
+
+        # Global Hotkeys for app window
+        self.bind("<Escape>", self._exit_focus)
+        self.is_focus = False
 
         self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
@@ -68,6 +89,7 @@ class HandControllerApp(ctk.CTk):
         if not os.path.exists(MODEL_PATH):
             print(f"[ERROR] Model not found: {MODEL_PATH}")
             sys.exit(1)
+            
         base_opts = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
         opts = mp_vision.HandLandmarkerOptions(
             base_options=base_opts,
@@ -91,25 +113,25 @@ class HandControllerApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        sidebar = ctk.CTkFrame(self, fg_color="#111118", corner_radius=0, border_width=0)
-        sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_propagate(False)
-        sidebar.configure(width=320)
+        self.sidebar = ctk.CTkFrame(self, fg_color="#111118", corner_radius=0, border_width=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_propagate(False)
+        self.sidebar.configure(width=320)
 
-        title_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
+        title_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         title_frame.pack(fill="x", padx=24, pady=(28, 4))
         ctk.CTkLabel(title_frame, text="HG Control", font=ctk.CTkFont(family="Segoe UI", size=26, weight="bold"), text_color="#e0e0f0").pack(anchor="w")
         ctk.CTkLabel(title_frame, text="Lite Edition  •  Spatial Computing", font=ctk.CTkFont(family="Segoe UI", size=11), text_color="#5a5a72").pack(anchor="w", pady=(2, 0))
 
-        ctk.CTkFrame(sidebar, height=1, fg_color="#222230").pack(fill="x", padx=20, pady=(18, 18))
+        ctk.CTkFrame(self.sidebar, height=1, fg_color="#222230").pack(fill="x", padx=20, pady=(18, 18))
 
-        self.smooth_slider = self._add_slider(sidebar, "Cursor Smoothing", 0.05, 0.80, 0.30)
-        self.zone_slider   = self._add_slider(sidebar, "Active Trackpad Zone", 0.30, 0.95, 0.65)
-        self.scroll_slider = self._add_slider(sidebar, "Scroll Speed", 0.20, 5.00, 1.00)
+        self.smooth_slider = self._add_slider(self.sidebar, "Cursor Smoothing", 0.05, 0.80, 0.30)
+        self.zone_slider   = self._add_slider(self.sidebar, "Active Trackpad Zone", 0.30, 0.95, 0.65)
+        self.scroll_slider = self._add_slider(self.sidebar, "Scroll Speed", 0.20, 5.00, 1.00)
 
-        ctk.CTkFrame(sidebar, height=1, fg_color="#222230").pack(fill="x", padx=20, pady=(22, 14))
+        ctk.CTkFrame(self.sidebar, height=1, fg_color="#222230").pack(fill="x", padx=20, pady=(22, 14))
 
-        card = ctk.CTkFrame(sidebar, fg_color="#16161f", corner_radius=12)
+        card = ctk.CTkFrame(self.sidebar, fg_color="#16161f", corner_radius=12)
         card.pack(fill="x", padx=20, pady=(0, 12))
         ctk.CTkLabel(card, text="Gesture Reference", font=ctk.CTkFont(size=13, weight="bold"), text_color="#9090a8").pack(anchor="w", padx=16, pady=(14, 8))
 
@@ -129,21 +151,77 @@ class HandControllerApp(ctk.CTk):
 
         ctk.CTkFrame(card, height=8, fg_color="transparent").pack()
 
-        self.status_label = ctk.CTkLabel(sidebar, text="● Initializing...", font=ctk.CTkFont(size=12), text_color="#4a4a60")
+        # Status Label
+        self.status_label = ctk.CTkLabel(self.sidebar, text="● Initializing...", font=ctk.CTkFont(size=12), text_color="#4a4a60")
         self.status_label.pack(side="bottom", anchor="w", padx=24, pady=(0, 20))
 
-        right_panel = ctk.CTkFrame(self, fg_color="#0d0d12", corner_radius=0)
-        right_panel.grid(row=0, column=1, sticky="nsew")
-        right_panel.grid_columnconfigure(0, weight=1)
-        right_panel.grid_rowconfigure(0, weight=1)
+        # Focus Mode Button
+        self.focus_btn = ctk.CTkButton(
+            self.sidebar, text="🔍 Enter Focus Mode", 
+            fg_color="#1e1e2a", hover_color="#2a2a35", text_color="#a0a0c0",
+            command=self._enter_focus
+        )
+        self.focus_btn.pack(side="bottom", padx=20, pady=(0, 10), fill="x")
 
-        cam_container = ctk.CTkFrame(right_panel, fg_color="#111118", corner_radius=14, border_width=1, border_color="#1e1e2a")
+        # Right Panel (Camera)
+        self.right_panel = ctk.CTkFrame(self, fg_color="#0d0d12", corner_radius=0)
+        self.right_panel.grid(row=0, column=1, sticky="nsew")
+        self.right_panel.grid_columnconfigure(0, weight=1)
+        self.right_panel.grid_rowconfigure(0, weight=1)
+
+        cam_container = ctk.CTkFrame(self.right_panel, fg_color="#111118", corner_radius=14, border_width=1, border_color="#1e1e2a")
         cam_container.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
         cam_container.grid_columnconfigure(0, weight=1)
         cam_container.grid_rowconfigure(0, weight=1)
 
         self.video_label = ctk.CTkLabel(cam_container, text="")
-        self.video_label.grid(row=0, column=0, padx=8, pady=8)
+        self.video_label.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
+
+    def _enter_focus(self):
+        """Hides the sidebar and collapses the column to make the camera fullscreen"""
+        self.sidebar.grid_forget()
+        self.grid_columnconfigure(0, minsize=0, weight=0) # Collapse the left column completely
+        self.is_focus = True
+
+    def _exit_focus(self, event=None):
+        """Restores the sidebar and column width when Escape is pressed"""
+        if self.is_focus:
+            self.sidebar.grid(row=0, column=0, sticky="nsew")
+            self.grid_columnconfigure(0, minsize=320, weight=0) # Restore the left column width
+            self.is_focus = False
+
+    # --- MINIMIZE TO TRAY LOGIC ---
+    def _on_close(self):
+        """Hides the main window and creates the system tray icon safely"""
+        self.withdraw() # Hide window
+        
+        # Create a simple tray icon dynamically (a dark square with a green dot)
+        icon_image = Image.new('RGB', (64, 64), color=(17, 17, 24))
+        draw = ImageDraw.Draw(icon_image)
+        draw.ellipse((16, 16, 48, 48), fill=(80, 230, 120))
+        
+        # Build the menu properly
+        menu = pystray.Menu(
+            item('Open Dashboard', self._show_window, default=True),
+            item('Quit HG Control', self._quit_app)
+        )
+        
+        self.tray_icon = pystray.Icon("hg_control", icon_image, "HG Control", menu)
+        # Start the tray icon in a separate daemon thread so it doesn't block the app
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _show_window(self, icon, item):
+        """Called when user clicks 'Open Dashboard' from the tray"""
+        self.tray_icon.stop()
+        self.after(0, self.deiconify) # Safely bring window back to main thread
+
+    def _quit_app(self, icon, item):
+        """Called when user clicks 'Quit' from the tray"""
+        self.tray_icon.stop()
+        self.cap.release()
+        self.landmarker.close()
+        self.quit()
+        sys.exit(0) # Ensure the process actually dies
 
     def _add_slider(self, parent, label_text: str, from_: float, to_: float, default: float) -> ctk.CTkSlider:
         wrapper = ctk.CTkFrame(parent, fg_color="transparent")
@@ -240,6 +318,12 @@ class HandControllerApp(ctk.CTk):
             GestureDetector.MOVE: (80, 230, 120),
         }
         gc = col_map.get(gesture, (180, 180, 180))
+        
+        # Add Focus Mode instruction text dynamically
+        focus_text = "Press ESC to exit Focus Mode" if self.is_focus else ""
+        if focus_text:
+            cv2.putText(frame, focus_text, (w // 2 - 100, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1, cv2.LINE_AA)
+        
         cv2.putText(frame, gesture, (12, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, gc, 1, cv2.LINE_AA)
         cv2.putText(frame, f"FPS {fps:.0f}  |  Hands {nh}", (w - 180, h - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (120, 120, 140), 1, cv2.LINE_AA)
@@ -281,17 +365,17 @@ class HandControllerApp(ctk.CTk):
 
             rgb_display = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(rgb_display)
-            pil_img = pil_img.resize((DISPLAY_W, DISPLAY_H), Image.LANCZOS)
-            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(DISPLAY_W, DISPLAY_H))
+            
+            # Dynamically resize the display depending on Focus Mode
+            current_w = self.video_label.winfo_width() if self.is_focus and self.video_label.winfo_width() > 10 else DISPLAY_W
+            current_h = self.video_label.winfo_height() if self.is_focus and self.video_label.winfo_height() > 10 else DISPLAY_H
+            
+            pil_img = pil_img.resize((current_w, current_h), Image.LANCZOS)
+            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(current_w, current_h))
             self.video_label.configure(image=ctk_img)
             self.video_label._ctk_img = ctk_img  
 
         self.after(12, self._update_frame)
-
-    def _on_close(self):
-        self.cap.release()
-        self.landmarker.close()
-        self.destroy()
 
 if __name__ == "__main__":
     app = HandControllerApp()

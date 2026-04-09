@@ -1,13 +1,16 @@
 """
 gestures.py – Mathematical Engine & OS Input Layer  (MediaPipe Tasks API)
 ==========================================================================
-Lite Edition Gestures
----------------------
-• Move Cursor   – Index finger extended alone.
-• Left Click    – Index + Thumb pinch (debounced).
-• Right Click   – Middle + Thumb pinch (debounced).
-• Scroll        – Index + Middle extended, vertical movement mapped to scroll.
-• Clutch / Idle – Fist (all fingers folded) pauses tracking.
+Compatible with mediapipe >= 0.10.14  (Tasks-based HandLandmarker)
+
+Responsibilities
+----------------
+1. EMA Smoothing        – tames webcam jitter while staying responsive.
+2. Dead-zone guard      – suppresses drift when hand is held still.
+3. Spatial Mapping      – active zone → full screen (trackpad-style).
+4. Gesture Recognition  – pinch=click, fist=idle/clutch.
+5. Debounce             – time-gated click prevents repeat-fire.
+6. OS Mouse Control     – PyAutoGUI moves/clicks the system cursor.
 """
 
 from __future__ import annotations
@@ -19,8 +22,8 @@ import numpy as np
 import pyautogui
 
 # ── PyAutoGUI safety ────────────────────────────────────────────────────────
-pyautogui.PAUSE = 0        
-pyautogui.FAILSAFE = True  
+pyautogui.PAUSE = 0   # Remove built-in 0.1 s inter-call sleep
+# FAILSAFE remains True: move cursor to top-left corner to abort.
 
 SCREEN_W, SCREEN_H = pyautogui.size()
 
@@ -30,6 +33,13 @@ SCREEN_W, SCREEN_H = pyautogui.size()
 # ═══════════════════════════════════════════════════════════════════════════
 
 class EMAFilter:
+    """
+    Exponential Moving Average filter for (x, y) cursor coordinates.
+
+    alpha       – blend factor: lower = smoother, higher = more responsive.
+    dead_zone_px – minimum pixel-distance change before committing a new pos.
+    """
+
     def __init__(self, alpha: float = 0.30, dead_zone_px: float = 3.5) -> None:
         self.alpha = alpha
         self.dead_zone_px = dead_zone_px
@@ -55,6 +65,11 @@ class EMAFilter:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SpatialMapper:
+    """
+    Maps a central sub-region of the camera frame to the full screen.
+    zone_ratio – fraction of frame width/height used as the active zone.
+    """
+
     def __init__(
         self,
         frame_w: int,
@@ -63,26 +78,18 @@ class SpatialMapper:
         screen_w: int = SCREEN_W,
         screen_h: int = SCREEN_H,
     ) -> None:
-        self.frame_w = frame_w
-        self.frame_h = frame_h
         self.sw, self.sh = screen_w, screen_h
-        self._update_zone(zone_ratio)
-
-    def _update_zone(self, zone_ratio: float) -> None:
-        mx = self.frame_w * (1 - zone_ratio) / 2
-        my = self.frame_h * (1 - zone_ratio) / 2
+        mx = frame_w * (1 - zone_ratio) / 2
+        my = frame_h * (1 - zone_ratio) / 2
         self.x1, self.y1 = mx, my
-        self.x2, self.y2 = self.frame_w - mx, self.frame_h - my
+        self.x2, self.y2 = frame_w - mx, frame_h - my
         self.zw = self.x2 - self.x1
         self.zh = self.y2 - self.y1
-
-    def set_zone_ratio(self, zone_ratio: float) -> None:
-        self._update_zone(zone_ratio)
 
     def map(self, cx: float, cy: float) -> tuple[float, float]:
         cx = max(self.x1, min(cx, self.x2))
         cy = max(self.y1, min(cy, self.y2))
-        nx = (cx - self.x1) / self.zw
+        nx = (cx - self.x1) / self.zw   # flip x for mirror UX
         ny = (cy - self.y1) / self.zh
         return nx * self.sw, ny * self.sh
 
@@ -92,22 +99,33 @@ class SpatialMapper:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. Gesture Detector  
+# 3. Gesture Detector  (works with mediapipe Tasks NormalizedLandmark list)
 # ═══════════════════════════════════════════════════════════════════════════
 
-_THUMB_TIP  = 4
-_IDX_TIP    = 8
-_MID_TIP    = 12
+# MediaPipe hand landmark indices
+_IDX_TIP   = 8    # Index fingertip
+_THUMB_TIP = 4    # Thumb tip
+_FINGER_TIPS_PIPS = [
+    (8,  6),   # index  tip, pip
+    (12, 10),  # middle tip, pip
+    (16, 14),  # ring   tip, pip
+    (20, 18),  # pinky  tip, pip
+]
+
 
 def _dist(a, b) -> float:
     return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
 
+
+def _folded(lm, tip_i: int, pip_i: int) -> bool:
+    """True if finger tip is below its PIP joint (image-space y grows down)."""
+    return lm[tip_i].y > lm[pip_i].y
+
+
 class GestureDetector:
-    MOVE        = "MOVE"
-    LEFT_CLICK  = "LEFT_CLICK"
-    RIGHT_CLICK = "RIGHT_CLICK"
-    SCROLL      = "SCROLL"
-    IDLE        = "IDLE"
+    MOVE  = "MOVE"
+    CLICK = "LEFT_CLICK"
+    IDLE  = "IDLE"
 
     def __init__(
         self,
@@ -116,69 +134,43 @@ class GestureDetector:
     ) -> None:
         self.pinch_thresh = pinch_thresh
         self.cooldown = click_cooldown_s
-        self._last_left_click: float = 0.0
-        self._left_click_fired: bool = False
-        self._last_right_click: float = 0.0
-        self._right_click_fired: bool = False
+        self._last_click: float = 0.0
+        self._click_fired: bool = False
 
     def detect(self, landmarks) -> str:
         lm = landmarks
 
-        # 1. ROTATION-INVARIANT FINGER CHECK
-        def _is_ext(tip_i, pip_i):
-            return _dist(lm[tip_i], lm[0]) > _dist(lm[pip_i], lm[0])
-
-        idx_up   = _is_ext(8, 6)
-        mid_up   = _is_ext(12, 10)
-        ring_up  = _is_ext(16, 14)
-        pinky_up = _is_ext(20, 18)
-
-        # 2. PINCH DISTANCES
-        d_idx = _dist(lm[4], lm[8])  # Thumb to Index
-        d_mid = _dist(lm[4], lm[12]) # Thumb to Middle
-
-        # ── IDLE / CLUTCH ─────────────────────────
-        if not idx_up and not mid_up and not ring_up and not pinky_up:
-            self._left_click_fired = False
-            self._right_click_fired = False
+        # IDLE – all four fingers folded (fist)
+        if all(_folded(lm, tip, pip) for tip, pip in _FINGER_TIPS_PIPS):
+            self._click_fired = False
             return self.IDLE
 
-        # ── SCROLL ──────────────────────────────────
-        if idx_up and mid_up and not ring_up and not pinky_up:
-            self._left_click_fired = False
-            self._right_click_fired = False
-            return self.SCROLL
-
-        # ── LEFT CLICK ───────────────────────────────────
-        if d_idx < self.pinch_thresh and d_idx <= d_mid:
+        # CLICK – index–thumb pinch
+        if _dist(lm[_THUMB_TIP], lm[_IDX_TIP]) < self.pinch_thresh:
             now = time.monotonic()
-            if not self._left_click_fired or (now - self._last_left_click) >= self.cooldown:
-                self._last_left_click = now
-                self._left_click_fired = True
-                return self.LEFT_CLICK
-            return self.MOVE
+            if not self._click_fired or (now - self._last_click) >= self.cooldown:
+                self._last_click = now
+                self._click_fired = True
+                return self.CLICK
+            return self.MOVE   # pinch held but in cooldown
         else:
-            self._left_click_fired = False
-
-        # ── RIGHT CLICK ─────────────────────────────────
-        if d_mid < self.pinch_thresh and d_mid < d_idx:
-            now = time.monotonic()
-            if not self._right_click_fired or (now - self._last_right_click) >= self.cooldown:
-                self._last_right_click = now
-                self._right_click_fired = True
-                return self.RIGHT_CLICK
-            return self.MOVE
-        else:
-            self._right_click_fired = False
+            self._click_fired = False
 
         return self.MOVE
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4. MouseController 
+# 4. MouseController  – high-level façade used by main.py
 # ═══════════════════════════════════════════════════════════════════════════
 
 class MouseController:
+    """
+    Wires SpatialMapper + EMAFilter + GestureDetector + PyAutoGUI together.
+
+    Call process(landmarks, frame_w, frame_h) once per frame.
+    Returns a dict with 'gesture', 'screen_xy', 'clutch' for the HUD.
+    """
+
     def __init__(
         self,
         frame_w: int,
@@ -188,14 +180,11 @@ class MouseController:
         zone_ratio: float = 0.65,
         pinch_thresh: float = 0.055,
         click_cooldown_s: float = 0.40,
-        scroll_speed: float = 1.0,
     ) -> None:
         self.mapper   = SpatialMapper(frame_w, frame_h, zone_ratio)
         self.smoother = EMAFilter(ema_alpha, dead_zone_px)
         self.detector = GestureDetector(pinch_thresh, click_cooldown_s)
         self._clutch  = False
-        self.scroll_speed = scroll_speed
-        self._prev_scroll_y: Optional[float] = None
 
     def process(self, landmarks, frame_w: int, frame_h: int) -> dict:
         gesture = self.detector.detect(landmarks)
@@ -204,40 +193,19 @@ class MouseController:
             if not self._clutch:
                 self._clutch = True
                 self.smoother.reset()
-            self._prev_scroll_y = None
-            return {"gesture": gesture, "screen_xy": None, "clutch": True, "scroll_delta": 0}
-
+            return {"gesture": gesture, "screen_xy": None, "clutch": True}
         self._clutch = False
+
+        # Index fingertip (landmark 8) drives the cursor
         tip = landmarks[_IDX_TIP]
         sx_r, sy_r = self.mapper.map(tip.x * frame_w, tip.y * frame_h)
         sx, sy = self.smoother.update(sx_r, sy_r)
         sx = max(0, min(sx, SCREEN_W - 1))
         sy = max(0, min(sy, SCREEN_H - 1))
 
-        scroll_delta = 0
-
-        if gesture == GestureDetector.LEFT_CLICK:
+        if gesture == GestureDetector.CLICK:
             pyautogui.click(sx, sy)
-            self._prev_scroll_y = None
-        elif gesture == GestureDetector.RIGHT_CLICK:
-            pyautogui.rightClick(sx, sy)
-            self._prev_scroll_y = None
-        elif gesture == GestureDetector.SCROLL:
-            avg_y = (landmarks[_IDX_TIP].y + landmarks[_MID_TIP].y) / 2.0
-            current_scroll_y = avg_y * frame_h
-            if self._prev_scroll_y is not None:
-                dy = self._prev_scroll_y - current_scroll_y  
-                scroll_delta = int(dy * self.scroll_speed * 0.25)
-                if scroll_delta != 0:
-                    pyautogui.scroll(scroll_delta)
-            self._prev_scroll_y = current_scroll_y
-        else:  
+        else:
             pyautogui.moveTo(sx, sy)
-            self._prev_scroll_y = None
 
-        return {
-            "gesture": gesture,
-            "screen_xy": (sx, sy),
-            "clutch": False,
-            "scroll_delta": scroll_delta,
-        }
+        return {"gesture": gesture, "screen_xy": (sx, sy), "clutch": False}

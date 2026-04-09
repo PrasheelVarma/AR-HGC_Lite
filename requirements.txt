@@ -1,21 +1,24 @@
-# ─── Hand Gesture Mouse Controller ─ requirements.txt ───────────────────────
+# ─── Hand Gesture OS Controller (Lite) ─ requirements.txt ───────────────────
 #
 # Install with:  pip install -r requirements.txt
 #
 # Python >= 3.10 required (tested on 3.12)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Computer-vision / ML
-# IMPORTANT: mediapipe >= 0.10.18 dropped the legacy mp.solutions API.
-# Pin to 0.10.9 which is the last well-tested version with solutions support.
-mediapipe==0.10.9
+# Computer-vision / ML  (Tasks API: HandLandmarker)
+mediapipe>=0.10.14
 
-# OpenCV – standard build (not contrib); must be installed AFTER mediapipe
-# because mediapipe's auto-dependency is opencv-contrib-python which conflicts.
-opencv-python==4.10.0.84
+# OpenCV – standard build
+opencv-python>=4.8.0
 
 # OS-level mouse / keyboard control
-pyautogui==0.9.54
+pyautogui>=0.9.54
+
+# Modern dark-mode GUI toolkit
+customtkinter>=5.2.0
+
+# Image handling for GUI embedding
+Pillow>=10.0.0
 
 # Utility
-numpy==1.26.4
+numpy>=1.24.0
